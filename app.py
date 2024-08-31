@@ -1,20 +1,23 @@
 # I dedicate this code to the public domain.
 # dependent packages: discord.py, RealtimeSTT
-
 """
-This bot is meant to provide live voice transcription on request by specific people on the Lego Steppers discord.
+This bot is meant to provide live voice transcription on request by specific
+people on the Lego Steppers discord.
 
 Usage:
     1. Join a voice channel
-    2. switch to a channel in which you want your words to be transcribed, i.e. #test-voice-to-text-output
-    3. from that channel, run the "/transcribe" slash command
+    2. switch to a channel in which you want your words to be transcribed, i.e.
+    #test-voice-to-text-output 3. from that channel, run the "/transcribe" slash
+    command
 
-For the duration of your connection to that voice channel, spoken words will be transcribed from Nacl's computer into the chosen chat channel.  Transcription will end when the requester disconnects from the specified voice chat channel.
+For the duration of your connection to that voice channel, spoken words will be
+transcribed from Nacl's computer into the chosen chat channel.  Transcription
+will end when the requester disconnects from the specified voice chat channel.
 
-If the user of the /transcribe command is not in a voice channel, an appropriate error should be shown
-If the user of the /transcribe command is not authorized to use the command, an appropriate error should be shown (shouldn't even show up as a command?)
-
-
+If the user of the /transcribe command is not in a voice channel, an appropriate
+error should be shown If the user of the /transcribe command is not authorized
+to use the command, an appropriate error should be shown (shouldn't even show up
+as a command?)
 """
 
 import asyncio
@@ -22,7 +25,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, voice_recv
 import time
-from RealtimeSTT import AudioToTextRecorder
+import websockets
 
 """
 Discord API variables
@@ -31,6 +34,7 @@ permissions_integer=1050624  # probably not needed
 """
 
 MY_GUILD = discord.Object(id=818478021563908116)
+MY_USER_ID = 151847709286989824
 transcription_ok_roles = {
     'housekeeping': 818490394123698177,
     'housekeeping_emeritus': 1062177151371198504,
@@ -38,8 +42,12 @@ transcription_ok_roles = {
     'transcription_approved': 1274617618296340521
 }
 
-transcription_tasks = {}
-active_voiceclient = None
+#transcription_tasks = {}
+#active_voiceclient = None
+transcription_channel = None
+transcription_user = None
+STT_websocket_listen_address = "::1" #ipv6 localhost
+STT_websocket_listen_port = 48156
 
 class MyClient(discord.Client):
     def __init__(self, *, intents: discord.Intents, activity: discord.CustomActivity):
@@ -57,24 +65,6 @@ client = MyClient(intents=intents, activity=discord.CustomActivity(name="Voice T
 def text_detected(text):
     #do something with text
     pass
-
-# configure this to be fed audio data from discord.py.  I'm handing voice data to RSTT for transcription, it's not recording sound from my mic on its own.
-recorder_config = {
-        'spinner': False,
-        'model': 'large-v2',
-        'silero_sensitivity': 0.4,
-        'webrtc_sensitivity': 2,
-        'post_speech_silence_duration': 0.4,
-        'min_length_of_recording': 0,
-        'min_gap_between_recordings': 0,
-        'enable_realtime_transcription': True,
-        'realtime_processing_pause': 0.2,
-        'realtime_model_type': 'tiny',
-        'on_realtime_transcription_update': text_detected,
-        'silero_deactivity_detection': True,
-        'use_microphone': False,
-}
-recorder = AudioToTextRecorder(**recorder_config)
 
 @client.event
 async def on_ready():
@@ -103,7 +93,33 @@ async def DisconnectVoiceChannel(channel):
     pass
 
 """
+/transcribehere
+"""
+@client.tree.command()
+async def transcribehere(interaction: discord.Interaction):
+    """
+    Does the following:
+        1. picks the designated channel for text output
+        2. starts the websocket server for local messaging from the
+        transcription process
+    """
+    global transcription_channel
+    if interaction.user.id != MY_USER_ID:
+        print(f'someone tried to invoke transcribehere who is not JayDeezus (id: {interaction.user.id})')
+        return
+    
+    
+    
+    if transcription_channel:
+        transcription_channel = None
+        await interaction.response.send_message('No longer transcribing here.')
+    else:
+        transcription_channel = interaction.channel
+        await interaction.response.send_message('Transcribing here.')
+
+"""
 Define `/transcribeme` command
+"""
 """
 @client.tree.command()
 async def transcribeme(interaction: discord.Interaction):
@@ -152,6 +168,7 @@ async def transcribeme(interaction: discord.Interaction):
             active_voiceclient.listen(voice_recv.BasicSink(callback))
 
             await interaction.response.send_message(f'[WIP] {interaction.user.mention} is now transcribing voice chat to this channel.')
+"""
 
 """
 define something that happens when the person who started /transcribeme disconnects from voice chat
@@ -178,11 +195,69 @@ define event handler for when voice chat
 NOTE: discord.py does not seem to provide actually receiving voice data
 """
 
+"""
+signature of client.run:
+    
+    def run(
+        self,
+        token: str,
+        *,
+        reconnect: bool = True,
+        log_handler: Optional[logging.Handler] = MISSING,
+        log_formatter: logging.Formatter = MISSING,
+        log_level: int = MISSING,
+        root_logger: bool = False,
+    ) -> None:
+"""
 
+async def transcription_message_handler(websocket):
+    print(f'local connection to transcriber open')
+    async for message in websocket:
+        print(f'\"{message}\" >> {transcription_channel or 'NO CHANNEL'}')
+        if transcription_channel:
+            await transcription_channel.send(message)
+    print(f'local connection to transcriber closed')
+    await transcription_channel.send("No longer transcribing here.")
+
+async def transcription_message_websocket():
+    """
+    loop to receive data from the websocket server doing the listening from my
+    mic.
+    
+    Or wherever.
+    """
+    #initialize websocket listener
+    async with websockets.serve(
+        transcription_message_handler, 
+        STT_websocket_listen_address,
+        STT_websocket_listen_port,
+        ping_interval=None
+    ):
+        await asyncio.get_running_loop().create_future() #run forever
+
+async def main(token, client):
+    async with client:
+        """
+        This just starts and blocks.  I need to figure out how to run an event
+        loop that weaves in both the discord.py stuff and the second websocket
+        that is listening for text from a local process.
+        """
+        await asyncio.gather(client.start(token), transcription_message_websocket())
 
 with open('blipblap', 'r') as file:
-    data = file.read()
-    client.run(data) #blocks
+    token = file.read()
+    """
+    TODO need to turn client.run(data) and break it out so I can insert an async
+    task that will check RealtimeSTT for input
+    - replace client.run with whatever it invokes up until asyncio.run is
+        encountered
+    """
+    #client.run(data) #blocks
+    try:
+        asyncio.run(main(token, client))
+    except KeyboardInterrupt:
+        pass
+    
     
 #cleanup
 #recorder.stop()
